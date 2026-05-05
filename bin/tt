@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# tt — Team Tools CLI  v0.2.0
-# 管理团队 skill / mcp / cli 工具（基于 git clone 本地仓库）
+# tt — Team Tools CLI  v0.3.0
+# 管理团队 skill / mcp / cli 工具（无需本地 clone 团队仓库）
 
 set -euo pipefail
 
 TT_HOME="${TT_HOME:-$HOME/.claude/team-tools}"
 REGISTRY="$TT_HOME/.registry.json"
 CONFIG="$HOME/.ttconfig"
-TT_VERSION="0.2.0"
+TT_VERSION="0.3.0"
 
 ########## 工具函数 ##########
 
@@ -18,12 +18,41 @@ warn() { echo "  ⚠ $*"; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "需要 $1，请先安装"; }
 
+# 获取远程仓库地址
+get_remote() {
+    local remote
+    remote=$(grep '^REMOTE=' "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
+    [ -z "$remote" ] && die "请先配置团队仓库: tt config set REMOTE=<git-url>"
+    echo "$remote"
+}
+
+# 交互式输入
+prompt_input() {
+    local prompt="$1" default="${2:-}"
+    local input
+    if [ -n "$default" ]; then
+        printf "  %s [%s]: " "$prompt" "$default"
+    else
+        printf "  %s: " "$prompt"
+    fi
+    read -r input
+    echo "${input:-$default}"
+}
+
+# 版本号 patch +1
+bump_version() {
+    local v="${1#v}"
+    local major minor patch
+    major=$(echo "$v" | cut -d. -f1)
+    minor=$(echo "$v" | cut -d. -f2)
+    patch=$(echo "$v" | cut -d. -f3)
+    echo "$major.$minor.$((patch + 1))"
+}
+
 # 解析 spec: [type/]namespace/name[@version]
-# 输出: type ns name version
 parse_spec() {
     local spec="$1" type="" ns="" name="" version="" rest="$spec"
 
-    # 提取 version
     if [[ "$rest" == *@* ]]; then
         version="${rest##*@}"
         rest="${rest%@*}"
@@ -33,12 +62,8 @@ parse_spec() {
         2)
             ns=$(echo "$rest" | cut -d/ -f1)
             name=$(echo "$rest" | cut -d/ -f2)
-            # 推断 type
-            for t in skill mcp cli; do
-                [ -d "$TT_HOME/$ns/$t/$name" ] && type="$t" && break
-            done
-            # registry 兜底
-            [ -z "$type" ] && type=$(python3 -c "
+            # 从 registry 推断 type
+            type=$(python3 -c "
 import json
 with open('$REGISTRY') as f:
     for k in json.load(f).get('tools',{}):
@@ -46,6 +71,10 @@ with open('$REGISTRY') as f:
         if p[1]=='$ns' and p[2]=='$name':
             print(p[0]); break
 " 2>/dev/null)
+            # 从标准目录推断
+            [ -z "$type" ] && [ -d "$HOME/.claude/skills/$name" ] && type="skill"
+            [ -z "$type" ] && [ -d "$HOME/.claude/mcp/$name" ] && type="mcp"
+            [ -z "$type" ] && [ -d "$HOME/.claude/cli/$name" ] && type="cli"
             [ -z "$type" ] && type="skill"
             ;;
         3)
@@ -58,24 +87,28 @@ with open('$REGISTRY') as f:
     echo "$type" "$ns" "$name" "$version"
 }
 
-# 获取 tool 在本地仓库的目录
-tool_dir() {
+# 获取 tool 在标准目录的本地路径
+local_tool_dir() {
     local type="$1" ns="$2" name="$3"
-    [ "$ns" != "global" ] && echo "$TT_HOME/apps/$ns/$type/$name" || echo "$TT_HOME/global/$type/$name"
-}
-
-# 获取项目中 claude skills 目录（应用级）
-project_skills_dir() {
-    local ns="$1"
-    local path
-    path=$(grep "^PROJECT_${ns}=" "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
-    [ -z "$path" ] && return 1
-    echo "$path/.claude/skills"
+    local type_dir
+    case "$type" in
+        skill) type_dir="skills" ;;
+        mcp)   type_dir="mcp" ;;
+        cli)   type_dir="cli" ;;
+        *)     type_dir="skills" ;;
+    esac
+    if [ "$ns" = "global" ]; then
+        echo "$HOME/.claude/$type_dir/$name"
+    else
+        local proj
+        proj=$(grep "^PROJECT_${ns}=" "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
+        [ -z "$proj" ] && return 1
+        echo "$proj/.claude/$type_dir/$name"
+    fi
 }
 
 # 读取 yaml 字段
 yaml_get() {
-    # 优先 PyYAML
     local val
     val=$(python3 -c "
 import yaml
@@ -84,95 +117,343 @@ try:
         print(yaml.safe_load(f).get('$2','') or '')
 except: pass
 " 2>/dev/null)
-    # 无 PyYAML 时回退到 grep
     if [ -z "$val" ]; then
         val=$(grep "^${2}:" "$1" 2>/dev/null | head -1 | sed "s/^${2}: *//" | sed 's/^"//;s/"$//' || true)
     fi
     echo "$val"
 }
 
+########## 远程操作 ##########
+
+# 浅克隆远程仓库到临时目录
+remote_clone_temp() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    git clone --depth 1 "$(get_remote)" "$tmpdir" --quiet 2>/dev/null || {
+        rm -rf "$tmpdir"
+        die "无法连接团队仓库，请检查网络和 REMOTE 配置"
+    }
+    echo "$tmpdir"
+}
+
+# 获取远程 tool 列表
+remote_list_tools() {
+    local tmpdir
+    tmpdir=$(remote_clone_temp)
+
+    for type_dir in "$tmpdir"/global/*/; do
+        [ -d "$type_dir" ] || continue
+        local t
+        t=$(basename "$type_dir")
+        for tool_dir in "$type_dir"/*/; do
+            [ -d "$tool_dir" ] || continue
+            local n
+            n=$(basename "$tool_dir")
+            echo "$t/global/$n"
+        done
+    done
+
+    for ns_dir in "$tmpdir"/apps/*/; do
+        [ -d "$ns_dir" ] || continue
+        local ns
+        ns=$(basename "$ns_dir")
+        for type_dir in "$ns_dir"/*/; do
+            [ -d "$type_dir" ] || continue
+            local t
+            t=$(basename "$type_dir")
+            for tool_dir in "$type_dir"/*/; do
+                [ -d "$tool_dir" ] || continue
+                local n
+                n=$(basename "$tool_dir")
+                echo "$t/$ns/$n"
+            done
+        done
+    done
+
+    rm -rf "$tmpdir"
+}
+
+# 获取远程 tool 的版本列表
+remote_versions() {
+    local type="$1" ns="$2" name="$3"
+    local tmpdir src
+    tmpdir=$(remote_clone_temp)
+    [ "$ns" = "global" ] && src="$tmpdir/global/$type/$name" || src="$tmpdir/apps/$ns/$type/$name"
+    ls -1 "$src" 2>/dev/null | grep '^v[0-9]' | sort -Vr | sed 's/^v//' || true
+    rm -rf "$tmpdir"
+}
+
+# 下载 tool 到目标目录，返回版本号
+download_tool() {
+    local type="$1" ns="$2" name="$3" version="${4:-}" target="$5"
+    local tmpdir src ver_dir
+    tmpdir=$(remote_clone_temp)
+    [ "$ns" = "global" ] && src="$tmpdir/global/$type/$name" || src="$tmpdir/apps/$ns/$type/$name"
+
+    if [ -z "$version" ]; then
+        version=$(ls -1 "$src" 2>/dev/null | grep '^v[0-9]' | sort -Vr | head -1 | sed 's/^v//' || true)
+        [ -z "$version" ] && { rm -rf "$tmpdir"; die "未找到: ${type}/${ns}/${name}"; }
+    fi
+    ver_dir="v${version#v}"
+
+    [ ! -d "$src/$ver_dir" ] && { rm -rf "$tmpdir"; die "版本不存在: ${type}/${ns}/${name} v${version}"; }
+
+    mkdir -p "$target"
+    find "$src/$ver_dir" -maxdepth 1 -mindepth 1 | while read -r f; do
+        cp -r "$f" "$target/"
+    done
+    # 复制父级 tool.yaml
+    [ -f "$src/tool.yaml" ] && cp "$src/tool.yaml" "$target/tool.yaml"
+
+    rm -rf "$tmpdir"
+    echo "${version#v}"
+}
+
+########## 路径检测 ##########
+
+# 从路径推断 type / namespace / name
+detect_tool_info() {
+    local path="$1"
+    local abs_path
+    abs_path=$(cd "$path" 2>/dev/null && pwd || echo "$path")
+    local detected_type="" detected_ns="" detected_name=""
+
+    detected_name=$(basename "$abs_path")
+
+    # 标准 .claude/<type>s/<name> 目录
+    if echo "$abs_path" | grep -q '/\.claude/'; then
+        detected_type=$(echo "$abs_path" | grep -oE '/\.claude/(skills|mcp|cli)/' | grep -oE '(skill|mcp|cli)' | sed 's/s$//')
+
+        local parent
+        parent=$(echo "$abs_path" | sed 's|/\.claude/.*||')
+        if [ "$parent" = "$HOME" ]; then
+            detected_ns="global"
+        else
+            detected_ns=$(basename "$parent")
+        fi
+    fi
+
+    # 兜底：根据目录内容推断
+    if [ -z "$detected_type" ]; then
+        if [ -f "$path/SKILL.md" ]; then detected_type="skill"
+        elif [ -f "$path/server.json" ]; then detected_type="mcp"
+        elif ls "$path"/*.sh >/dev/null 2>&1 || ls "$path"/*.py >/dev/null 2>&1; then detected_type="cli"
+        else detected_type="skill"
+        fi
+    fi
+    [ -z "$detected_ns" ] && detected_ns="global"
+
+    echo "$detected_type" "$detected_ns" "$detected_name"
+}
+
+########## 自动生成 tool.yaml ##########
+
+auto_generate_tool_yaml() {
+    local path="$1" type="$2" ns="$3" name="$4" version="$5" description="$6" author="$7"
+
+    local entrypoint
+    case "$type" in
+        skill) entrypoint="SKILL.md" ;;
+        mcp)   entrypoint="server.json" ;;
+        cli)   entrypoint="$name" ;;
+        *)     entrypoint="SKILL.md" ;;
+    esac
+
+    cat > "$path/tool.yaml" <<YAML
+name: $name
+type: $type
+namespace: $ns
+version: $version
+description: $description
+author: $author
+entrypoint: $entrypoint
+dependencies: []
+YAML
+}
+
 ########## 核心命令 ##########
 
-# tt install <spec>  — 安装 tool（建立符号链接）
+# tt install <spec>  — 从远程下载安装 tool
+# tt install --all [--scope global|app] [--type skill|mcp|cli]
 cmd_install() {
     local spec="${1:-}"
+
+    if [ "$spec" = "--all" ]; then
+        shift
+        cmd_install_all "$@"
+        return
+    fi
+
     [ -z "$spec" ] && die "用法: tt install [type/]namespace/name[@version]"
 
+    need_cmd git
     read -r type ns name version <<< "$(parse_spec "$spec")"
     local key="${type}/${ns}/${name}"
-    local dir
-    dir=$(tool_dir "$type" "$ns" "$name")
 
-    [ ! -d "$dir" ] && die "未找到: $key，请先执行 tt update"
+    # 确定目标目录
+    local target
+    target=$(local_tool_dir "$type" "$ns" "$name") || die "未配置项目路径: PROJECT_${ns}，请执行 tt config set PROJECT_${ns}=<path>"
 
-    # 选择版本
-    if [ -z "$version" ]; then
-        # 取最新版本目录
-        version="$(ls -1 "$dir" | grep '^v[0-9]' | sort -Vr | head -1 | sed 's/^v//' || true)"
-        [ -z "$version" ] && die "$key 没有可用版本"
+    if [ -d "$target" ] && [ "$(ls -A "$target" 2>/dev/null)" ]; then
+        warn "$key 已存在，将覆盖"
+        rm -rf "$target"
     fi
-    local ver_dir="v${version#v}"
 
-    [ ! -d "$dir/$ver_dir" ] && die "版本不存在: $key $ver_dir"
-    [ ! -f "$dir/$ver_dir/tool.yaml" ] && die "$key $ver_dir 缺少 tool.yaml"
+    info "安装 $key ..."
 
-    info "安装 ${key} v${version#v}"
+    local installed_version
+    installed_version=$(download_tool "$type" "$ns" "$name" "$version" "$target")
+    ok "已下载 v${installed_version}"
 
-    # 设置 current 符号链接
-    rm -f "$dir/current"
-    ln -sf "$ver_dir" "$dir/current"
+    # 后置操作
+    case "$type" in
+        mcp)
+            local settings
+            if [ "$ns" = "global" ]; then
+                settings="$HOME/.claude/settings.json"
+            else
+                local proj
+                proj=$(grep "^PROJECT_${ns}=" "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
+                settings="$proj/.claude/settings.json"
+            fi
+            if [ -f "$target/server.json" ]; then
+                mkdir -p "$(dirname "$settings")"
+                python3 -c "
+import json
+try:
+    with open('$settings') as f: cfg = json.load(f)
+except: cfg = {}
+cfg.setdefault('mcpServers', {})
+with open('$target/server.json') as f: cfg['mcpServers']['$name'] = json.load(f)
+with open('$settings', 'w') as f: json.dump(cfg, f, indent=2)
+" 2>/dev/null && ok "MCP 配置已写入 settings.json"
+            fi
+            ;;
+        cli)
+            mkdir -p "$HOME/bin"
+            local entry
+            entry=$(yaml_get "$target/tool.yaml" entrypoint)
+            [ -z "$entry" ] && entry="$name"
+            if [ -f "$target/$entry" ]; then
+                chmod +x "$target/$entry"
+                rm -f "$HOME/bin/$name"
+                ln -sf "$target/$entry" "$HOME/bin/$name"
+                ok "CLI 已链接到 ~/bin/$name"
+            fi
+            ;;
+    esac
 
-    # 注册
+    # 更新 registry
+    local installed_at
+    installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     python3 -c "
 import json
-with open('$REGISTRY') as f:
-    data = json.load(f)
+with open('$REGISTRY') as f: data = json.load(f)
 data['tools']['$key'] = {
     'name': '$name', 'type': '$type', 'namespace': '$ns',
-    'version': '${version#v}',
-    'installed_at': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
-    'path': '$dir'
+    'version': '$installed_version',
+    'installed_at': '$installed_at',
+    'path': '$target'
 }
-with open('$REGISTRY', 'w') as f:
-    json.dump(data, f, indent=2)
-"
+with open('$REGISTRY', 'w') as f: json.dump(data, f, indent=2)
+" 2>/dev/null
 
-    # 同步到 Claude Code
-    do_link_tool "$type" "$ns" "$name"
-    ok "安装完成: $key v${version#v}"
+    ok "安装完成: $key v${installed_version}"
 }
 
-# tt update [tool]  — git pull 更新仓库，可选更新单个 tool
+# tt install --all
+cmd_install_all() {
+    local scope="" filter_type=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --scope) scope="$2"; shift 2 ;;
+            --type)  filter_type="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    need_cmd git
+    info "获取远程 tool 列表 ..."
+    local tools
+    tools=$(remote_list_tools) || die "无法获取远程 tool 列表"
+
+    local installed=0 skipped=0
+    # 先收集到数组避免 subshell
+    local filtered=()
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local t ns
+        t=$(echo "$line" | cut -d/ -f1)
+        ns=$(echo "$line" | cut -d/ -f2)
+        [ -n "$scope" ] && [ "$ns" != "$scope" ] && continue
+        [ -n "$filter_type" ] && [ "$t" != "$filter_type" ] && continue
+        filtered+=("$line")
+    done <<< "$tools"
+
+    if [ ${#filtered[@]} -eq 0 ]; then
+        warn "未找到匹配的 tool"
+        return
+    fi
+
+    info "将安装 ${#filtered[@]} 个 tool ..."
+    for tool in "${filtered[@]}"; do
+        local t ns n
+        t=$(echo "$tool" | cut -d/ -f1)
+        ns=$(echo "$tool" | cut -d/ -f2)
+        n=$(echo "$tool" | cut -d/ -f3)
+        if cmd_install "${t}/${ns}/${n}" 2>/dev/null; then
+            installed=$((installed + 1))
+        else
+            warn "跳过: ${t}/${ns}/${n}"
+            skipped=$((skipped + 1))
+        fi
+    done
+    ok "批量安装完成: ${installed} 成功${skipped:+ / $skipped 跳过}"
+}
+
+# tt update [tool]  — 从远程拉取更新
 cmd_update() {
     local spec="${1:-}"
+    need_cmd git
 
-    info "同步团队仓库 ..."
-    git -C "$TT_HOME" pull --ff-only 2>/dev/null || {
-        warn "git pull 失败，请检查网络或本地修改"
-        return 1
-    }
-    ok "仓库已更新"
+    if [ -n "$spec" ]; then
+        read -r type ns name version <<< "$(parse_spec "$spec")"
+        local key="${type}/${ns}/${name}"
+        local target
+        target=$(local_tool_dir "$type" "$ns" "$name") || die "未配置项目路径: PROJECT_${ns}"
 
-    if [ -z "$spec" ]; then
-        # 重新链接所有已安装的 tool 到最新版本
-        info "刷新已安装 tool ..."
-        python3 -c "
+        if [ ! -d "$target" ]; then
+            die "$key 未安装，请先执行 tt install"
+        fi
+
+        local remote_ver local_ver
+        remote_ver=$(remote_versions "$type" "$ns" "$name" 2>/dev/null | head -1 || true)
+        [ -z "$remote_ver" ] && die "无法获取远程版本: $key"
+        local_ver=$(yaml_get "$target/tool.yaml" version)
+
+        if [ "$local_ver" = "$remote_ver" ]; then
+            ok "$key 已是最新 v${local_ver}"
+        else
+            info "更新: $key  v${local_ver} → v${remote_ver}"
+            cmd_install "${type}/${ns}/${name}@${remote_ver}"
+        fi
+    else
+        info "检查所有已安装 tool 更新 ..."
+        local keys
+        keys=$(python3 -c "
 import json
 with open('$REGISTRY') as f:
-    data = json.load(f)
-for k in data['tools']:
-    print(k)
-" 2>/dev/null | while read -r key; do
-            local type ns name
-            type=$(echo "$key" | cut -d/ -f1)
-            ns=$(echo "$key" | cut -d/ -f2)
-            name=$(echo "$key" | cut -d/ -f3)
-            cmd_install "${type}/${ns}/${name}" 2>/dev/null || true
-        done
+    for k in json.load(f).get('tools',{}): print(k)
+" 2>/dev/null)
+        if [ -z "$keys" ]; then
+            warn "暂无已安装的 tool"
+            return
+        fi
+        while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            cmd_update "$key" 2>/dev/null || true
+        done <<< "$keys"
         ok "全部已更新"
-    else
-        read -r type ns name version <<< "$(parse_spec "$spec")"
-        cmd_install "${type}/${ns}/${name}"
     fi
 }
 
@@ -181,19 +462,16 @@ cmd_list() {
     local mode="${1:-local}"
 
     if [ "$mode" = "--remote" ]; then
+        need_cmd git
         info "远程可用 tool:"
-        local cache="$TT_HOME/.cache/tags"
-        git -C "$TT_HOME" fetch --tags --quiet 2>/dev/null || true
-        printf "  %-50s %-12s %s\n" "TOOL" "VERSION" "TYPE"
-        printf "  %-50s %-12s %s\n" "----" "-------" "----"
-        git -C "$TT_HOME" tag -l '*/v*' --sort=-v:refname 2>/dev/null | while read -r tag; do
-            local ver t ns n rest
-            ver=$(echo "$tag" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+$' || true)
-            rest="${tag%/$ver}"
-            n=$(basename "$rest")
-            ns=$(basename "$(dirname "$rest")")
-            t=$(basename "$(dirname "$(dirname "$rest")")")
-            printf "  %-50s %-12s %s\n" "${t}/${ns}/${n}" "$ver" "$t"
+        local tools
+        tools=$(remote_list_tools) || die "无法获取远程 tool 列表"
+        printf "  %-50s %s\n" "TOOL" "TYPE"
+        printf "  %-50s %s\n" "----" "----"
+        echo "$tools" | sort | while read -r tool; do
+            local t
+            t=$(echo "$tool" | cut -d/ -f1)
+            printf "  %-50s %s\n" "$tool" "$t"
         done
     else
         info "已安装 tool:"
@@ -235,87 +513,62 @@ cmd_info() {
     [ -z "$spec" ] && die "用法: tt info [type/]namespace/name"
 
     read -r type ns name version <<< "$(parse_spec "$spec")"
-    local dir
-    dir=$(tool_dir "$type" "$ns" "$name")
     local key="${type}/${ns}/${name}"
 
-    [ ! -d "$dir" ] && die "未找到: $key"
-    local cur_ver="?"
-    [ -L "$dir/current" ] && cur_ver=$(readlink "$dir/current")
+    local dir
+    dir=$(local_tool_dir "$type" "$ns" "$name") || die "未配置项目路径: PROJECT_${ns}"
+
+    [ ! -d "$dir" ] && die "未安装: $key，请先执行 tt install"
 
     echo "  ${key}"
     echo "  ─────────────────────────────────────"
-    local meta="$dir/$cur_ver/tool.yaml"
-    [ -f "$meta" ] || meta="$dir/tool.yaml"
+    local meta="$dir/tool.yaml"
     if [ -f "$meta" ]; then
         echo "  名称:       $(yaml_get "$meta" name)"
         echo "  类型:       $(yaml_get "$meta" type)"
         echo "  命名空间:   $(yaml_get "$meta" namespace)"
-        echo "  当前版本:   $cur_ver"
+        echo "  版本:       $(yaml_get "$meta" version)"
         echo "  描述:       $(yaml_get "$meta" description)"
         echo "  作者:       $(yaml_get "$meta" author)"
     fi
+    echo "  本地路径:   $dir"
 
-    echo "  版本列表:"
-    for v in "$dir"/v*/; do
-        [ -d "$v" ] && echo "    - $(basename "$v")"
-    done
-
-    echo "  链接状态:"
-    case "$type" in
-        skill)
-            local link_dest
-            [ "$ns" = "global" ] && link_dest="$HOME/.claude/skills/$name" || link_dest="$(project_skills_dir "$ns" 2>/dev/null || echo '?')/$name"
-            [ -L "$link_dest" ] && ok "$link_dest" || warn "未链接，执行 tt sync"
-            ;;
-        cli)
-            [ -L "$HOME/bin/$name" ] && ok "~/bin/$name" || warn "未链接，执行 tt sync"
-            ;;
-        mcp)
-            echo "    请检查 settings.json 中的 mcpServers.$name 配置"
-            ;;
-    esac
+    echo ""
+    echo "  远程版本:"
+    local versions
+    versions=$(remote_versions "$type" "$ns" "$name" 2>/dev/null || true)
+    if [ -n "$versions" ]; then
+        echo "$versions" | while read -r v; do
+            echo "    - v$v"
+        done
+    else
+        echo "    (无法获取)"
+    fi
 }
 
 # tt rollback <tool> [version]
 cmd_rollback() {
-    local spec="${1:-}" target="${2:-}"
+    local spec="${1:-}" target_ver="${2:-}"
     [ -z "$spec" ] && die "用法: tt rollback <tool> [version]"
 
     read -r type ns name version <<< "$(parse_spec "$spec")"
-    local dir
-    dir=$(tool_dir "$type" "$ns" "$name")
     local key="${type}/${ns}/${name}"
 
-    [ ! -d "$dir" ] && die "未安装: $key"
-
-    if [ -z "$target" ]; then
-        local cur
-        cur=$(readlink "$dir/current" 2>/dev/null || echo "")
-        target=$(ls -1 "$dir" | grep '^v[0-9]' | sort -V | grep -B1 "${cur#v}" | head -1 || true)
-        [ -z "$target" ] || [ "$target" = "${cur#v}" ] && die "没有可回滚的历史版本"
+    if [ -z "$target_ver" ]; then
+        info "远程可用版本:"
+        local versions
+        versions=$(remote_versions "$type" "$ns" "$name" 2>/dev/null || true)
+        if [ -z "$versions" ]; then
+            die "无法获取远程版本列表"
+        fi
+        echo "$versions" | while read -r v; do
+            echo "    v$v"
+        done
+        die "请指定版本: tt rollback ${spec} <version>"
     fi
-    [ "${target:0:1}" != "v" ] && target="v${target}"
-    [ ! -d "$dir/$target" ] && die "版本不存在: $target"
 
-    local old
-    old=$(readlink "$dir/current" 2>/dev/null || echo "?")
-    info "回滚: $key  ${old} → ${target}"
-    rm -f "$dir/current"
-    ln -sf "$target" "$dir/current"
-
-    local ver_no_v="${target#v}"
-    python3 -c "
-import json
-with open('$REGISTRY') as f:
-    data = json.load(f)
-if '$key' in data['tools']:
-    data['tools']['$key']['version'] = '$ver_no_v'
-    with open('$REGISTRY', 'w') as f:
-        json.dump(data, f, indent=2)
-" 2>/dev/null
-
-    do_link_tool "$type" "$ns" "$name"
+    info "回滚 $key → v${target_ver}"
+    cmd_install "${type}/${ns}/${name}@${target_ver}"
     ok "回滚完成"
 }
 
@@ -325,174 +578,211 @@ cmd_uninstall() {
     [ -z "$spec" ] && die "用法: tt uninstall <tool>"
 
     read -r type ns name version <<< "$(parse_spec "$spec")"
-    local dir
-    dir=$(tool_dir "$type" "$ns" "$name")
     local key="${type}/${ns}/${name}"
 
-    info "卸载 $key (保留仓库文件)"
+    local dir
+    dir=$(local_tool_dir "$type" "$ns" "$name") 2>/dev/null || true
+    [ -z "$dir" ] || [ ! -d "$dir" ] && die "未找到: $key"
 
-    # 移除 Claude Code 链接
-    case "$type" in
-        skill)
-            local ld
-            [ "$ns" = "global" ] && ld="$HOME/.claude/skills/$name" || ld="$(project_skills_dir "$ns" 2>/dev/null || echo '')/$name"
-            [ -L "$ld" ] && rm -f "$ld" && ok "已移除 $ld"
-            ;;
-        cli)
-            [ -L "$HOME/bin/$name" ] && rm -f "$HOME/bin/$name" && ok "已移除 ~/bin/$name"
-            ;;
-    esac
+    info "卸载 $key"
+    rm -rf "$dir"
+    ok "已移除 $dir"
 
-    # 移除 current 链接
-    rm -f "$dir/current"
+    # 清理 CLI 链接
+    [ "$type" = "cli" ] && rm -f "$HOME/bin/$name" && ok "已移除 ~/bin/$name"
+
+    # 清理 MCP 配置
+    if [ "$type" = "mcp" ]; then
+        local settings
+        if [ "$ns" = "global" ]; then
+            settings="$HOME/.claude/settings.json"
+        else
+            local proj
+            proj=$(grep "^PROJECT_${ns}=" "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
+            settings="$proj/.claude/settings.json"
+        fi
+        if [ -f "$settings" ]; then
+            python3 -c "
+import json
+with open('$settings') as f: cfg = json.load(f)
+cfg.get('mcpServers', {}).pop('$name', None)
+with open('$settings', 'w') as f: json.dump(cfg, f, indent=2)
+" 2>/dev/null && ok "已清理 MCP 配置"
+        fi
+    fi
 
     # 从 registry 移除
     python3 -c "
 import json
-with open('$REGISTRY') as f:
-    data = json.load(f)
+with open('$REGISTRY') as f: data = json.load(f)
 data['tools'].pop('$key', None)
-with open('$REGISTRY', 'w') as f:
-    json.dump(data, f, indent=2)
+with open('$REGISTRY', 'w') as f: json.dump(data, f, indent=2)
 " 2>/dev/null
 
     ok "已卸载"
 }
 
-# tt sync  — 同步所有已安装 tool 到 Claude Code
-cmd_sync() {
-    info "同步 tool 到 Claude Code ..."
-    mkdir -p "$HOME/.claude/skills" "$HOME/bin"
+########## 创建 tool ##########
 
-    python3 -c "
-import json
-with open('$REGISTRY') as f:
-    tools = json.load(f).get('tools', {})
-for k, v in tools.items():
-    print(f'{k}\t{v.get(\"version\",\"\")}')
-" 2>/dev/null | while IFS=$'\t' read -r key ver; do
-        local type ns name
-        type=$(echo "$key" | cut -d/ -f1)
-        ns=$(echo "$key" | cut -d/ -f2)
-        name=$(echo "$key" | cut -d/ -f3)
-        do_link_tool "$type" "$ns" "$name"
+# tt new <name> [--type skill|mcp|cli] [--namespace global|app]
+cmd_new() {
+    local name="${1:-}"
+    [ -z "$name" ] && die "用法: tt new <name> [--type skill|mcp|cli] [--namespace global|app]"
+
+    local type="skill" ns="global"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --type)             type="$2"; shift 2 ;;
+            --ns|--namespace)   ns="$2"; shift 2 ;;
+            *) shift ;;
+        esac
     done
+    [[ "$type" =~ ^(skill|mcp|cli)$ ]] || die "type 必须为 skill/mcp/cli"
 
-    ok "同步完成"
-}
-
-# 链接单个 tool 到 Claude Code
-do_link_tool() {
-    local type="$1" ns="$2" name="$3"
     local dir
-    dir=$(tool_dir "$type" "$ns" "$name")
-    local src="$dir/current"
+    dir=$(local_tool_dir "$type" "$ns" "$name") || die "未配置项目路径: PROJECT_${ns}，请执行 tt config set PROJECT_${ns}=<path>"
+    [ -d "$dir" ] && die "已存在: $dir"
 
-    [ ! -d "$src" ] && { warn "跳过 ${type}/${ns}/${name}: 未安装"; return; }
+    mkdir -p "$dir"
+
+    local author
+    author=$(git config user.name 2>/dev/null || echo "unknown")
+    auto_generate_tool_yaml "$dir" "$type" "$ns" "$name" "1.0.0" "" "$author"
 
     case "$type" in
         skill)
-            if [ "$ns" = "global" ]; then
-                # 全局 skill → ~/.claude/skills/<name>
-                mkdir -p "$HOME/.claude/skills"
-                rm -f "$HOME/.claude/skills/$name"
-                ln -sf "$src" "$HOME/.claude/skills/$name"
-            else
-                # 应用 skill → <project>/.claude/skills/<name>
-                local proj_dir
-                proj_dir=$(project_skills_dir "$ns" 2>/dev/null || true)
-                if [ -n "$proj_dir" ]; then
-                    mkdir -p "$proj_dir"
-                    rm -f "$proj_dir/$name"
-                    ln -sf "$src" "$proj_dir/$name"
-                else
-                    warn "${ns}/${name}: 未配置项目路径，请执行: tt config set PROJECT_${ns}=/path/to/project"
-                fi
-            fi
+            cat > "$dir/SKILL.md" <<MD
+---
+name: $name
+description:
+---
+# $name
+
+TODO: 描述此 skill 的功能
+MD
             ;;
         mcp)
-            # MCP → 写入 settings.json
-            if [ -f "$src/server.json" ]; then
-                local mcp_config
-                [ "$ns" = "global" ] && mcp_config="$HOME/.claude/settings.json" || {
-                    local proj_dir
-                    proj_dir=$(grep "^PROJECT_${ns}=" "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
-                    [ -n "$proj_dir" ] && mcp_config="$proj_dir/.claude/settings.json"
-                }
-                if [ -n "${mcp_config:-}" ]; then
-                    python3 -c "
-import json
-try:
-    with open('$mcp_config') as f:
-        cfg = json.load(f)
-except: cfg = {}
-cfg.setdefault('mcpServers', {})
-with open('$src/server.json') as f:
-    cfg['mcpServers']['$name'] = json.load(f)
-with open('$mcp_config', 'w') as f:
-    json.dump(cfg, f, indent=2)
-" 2>/dev/null
-                fi
-            fi
+            echo '{"name":"'"$name"'","version":"1.0.0"}' > "$dir/server.json"
             ;;
         cli)
-            # CLI → ~/bin/<name>
-            local entry
-            entry=$(yaml_get "$src/tool.yaml" entrypoint)
-            [ -z "$entry" ] && entry="$name"
-            local exe="$src/$entry"
-            if [ -f "$exe" ]; then
-                chmod +x "$exe"
-                mkdir -p "$HOME/bin"
-                rm -f "$HOME/bin/$name"
-                ln -sf "$exe" "$HOME/bin/$name"
-            fi
+            cat > "$dir/$name" <<SH
+#!/usr/bin/env bash
+# $name — TODO: description
+set -euo pipefail
+echo "Hello from $name"
+SH
+            chmod +x "$dir/$name"
             ;;
     esac
+
+    ok "已创建: ${type}/${ns}/${name}"
+    echo ""
+    echo "  路径:   $dir"
+    echo ""
+    echo "  下一步:"
+    echo "    1. 编辑内容"
+    echo "    2. 执行: tt submit ${dir}"
 }
 
-########## 管理员命令 ##########
+########## 提交 tool ##########
 
-# tt submit <path>
+# tt submit [path]  — 提交 tool（自动检测 + 生成元信息 + 创建 PR）
 cmd_submit() {
     need_cmd git
-    local path="${1:-}"
-    [ -z "$path" ] && die "用法: tt submit <tool-directory>"
-    [ ! -f "$path/tool.yaml" ] && die "缺少 tool.yaml"
+    local path="${1:-.}"
+    [ ! -d "$path" ] && die "目录不存在: $path"
 
-    local name type ns version
-    name=$(yaml_get "$path/tool.yaml" name)
-    type=$(yaml_get "$path/tool.yaml" type)
-    ns=$(yaml_get "$path/tool.yaml" namespace)
-    version=$(yaml_get "$path/tool.yaml" version)
+    local abs_path
+    abs_path=$(cd "$path" 2>/dev/null && pwd || echo "$path")
 
-    [ -z "$name" ] && die "tool.yaml 缺少 name"
-    [[ "$type" =~ ^(skill|mcp|cli)$ ]] || die "type 必须为 skill/mcp/cli"
-    [ -z "$ns" ] && die "tool.yaml 缺少 namespace"
+    # 1. 检测 type / namespace / name
+    local type ns name
+    read -r type ns name <<< "$(detect_tool_info "$abs_path")"
 
+    # 2. 检查必要文件
+    case "$type" in
+        skill) [ ! -f "$abs_path/SKILL.md" ] && warn "缺少 SKILL.md 文件" ;;
+        mcp)   [ ! -f "$abs_path/server.json" ] && warn "缺少 server.json 文件" ;;
+    esac
+
+    # 3. 处理 tool.yaml
+    local version description author
+    if [ ! -f "$abs_path/tool.yaml" ]; then
+        author=$(git config user.name 2>/dev/null || echo "unknown")
+        echo ""
+        info "检测到新 tool: ${type}/${ns}/${name}"
+        echo ""
+        echo "  类型:       $type"
+        echo "  命名空间:   $ns"
+        echo "  名称:       $name"
+        echo "  作者:       $author"
+        echo ""
+        description=$(prompt_input "描述" "")
+        version="1.0.0"
+        auto_generate_tool_yaml "$abs_path" "$type" "$ns" "$name" "$version" "$description" "$author"
+        ok "tool.yaml 已自动生成"
+    else
+        version=$(yaml_get "$abs_path/tool.yaml" version)
+        [ -z "$version" ] && version="1.0.0"
+        description=$(yaml_get "$abs_path/tool.yaml" description || echo "")
+        author=$(yaml_get "$abs_path/tool.yaml" author || echo "unknown")
+
+        local new_default
+        new_default=$(bump_version "$version")
+        echo ""
+        info "当前版本: v${version}"
+        local new_version
+        new_version=$(prompt_input "新版本" "$new_default")
+        version="$new_version"
+
+        # 更新本地 tool.yaml 的版本号
+        python3 -c "
+import yaml
+with open('$abs_path/tool.yaml') as f: data = yaml.safe_load(f)
+data['version'] = '$version'
+with open('$abs_path/tool.yaml', 'w') as f: yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
+" 2>/dev/null || sed -i '' "s/^version:.*/version: $version/" "$abs_path/tool.yaml"
+    fi
+
+    echo ""
     info "提交: ${type}/${ns}/${name} v${version}"
 
-    local remote
-    remote=$(grep '^REMOTE=' "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
-    [ -z "$remote" ] && die "未配置 REMOTE"
+    # 4. 克隆远程到临时目录
+    local remote tmpdir
+    remote=$(get_remote)
+    tmpdir=$(remote_clone_temp)
 
-    local tmpdir branch
-    tmpdir=$(mktemp -d)
-    branch="submit/${type}/${ns}/${name}/v${version}"
-    git clone "$remote" "$tmpdir" --quiet
-
-    # 确定目标路径
+    # 5. 在临时目录中构建目标路径
     local dest
-    [ "$ns" = "global" ] && dest="$tmpdir/global/$type/$name/v${version}" || dest="$tmpdir/apps/$ns/$type/$name/v${version}"
-    mkdir -p "$dest"
-    cp -r "$path"/* "$dest/"
-    # 根级 tool.yaml
-    dirname "$dest" | xargs -I{} cp "$path/tool.yaml" "{}/tool.yaml"
+    [ "$ns" = "global" ] && dest="$tmpdir/global/$type/$name" || dest="$tmpdir/apps/$ns/$type/$name"
+    mkdir -p "$dest/v${version}"
 
+    # 6. 复制 tool 内容（排除 .git 目录和 tool.yaml）
+    find "$abs_path" -maxdepth 1 -mindepth 1 \( -name '.git' -prune \) -o \( -name 'tool.yaml' -prune \) -o -print | while read -r f; do
+        cp -r "$f" "$dest/v${version}/"
+    done
+
+    # 7. 复制 tool.yaml 到正确位置
+    if [ -f "$abs_path/tool.yaml" ]; then
+        cp "$abs_path/tool.yaml" "$dest/tool.yaml"
+        cp "$abs_path/tool.yaml" "$dest/v${version}/tool.yaml"
+    fi
+
+    # 8. Git 提交并推送分支
+    local branch
+    branch="submit/${type}/${ns}/${name}/v${version}"
+
+    git -C "$tmpdir" checkout -b "$branch" --quiet 2>/dev/null || die "创建分支失败"
     git -C "$tmpdir" add . 2>/dev/null
-    git -C "$tmpdir" commit -m "submit: ${type}/${ns}/${name} v${version}" --quiet
-    git -C "$tmpdir" push origin "$branch" --quiet
+    git -C "$tmpdir" commit -m "submit: ${type}/${ns}/${name} v${version}" --quiet 2>/dev/null || {
+        warn "无变更需要提交"
+        rm -rf "$tmpdir"
+        return 0
+    }
+    git -C "$tmpdir" push origin "$branch" --quiet 2>/dev/null || die "推送失败，请检查 git 写权限"
 
+    # 9. 创建 PR
     if command -v gh >/dev/null 2>&1; then
         local repo
         repo=$(echo "$remote" | sed 's|.*github.com[:/]||; s|\.git$||')
@@ -501,22 +791,28 @@ cmd_submit() {
             --body "提交者: $(whoami)
 
 类型: ${type}  命名空间: ${ns}  版本: v${version}
-描述: $(yaml_get "$path/tool.yaml" description || echo '无')" 2>/dev/null && ok "PR 已创建" || {
-            warn "无法创建 PR，分支: $branch"
+描述: ${description:-无}" 2>/dev/null && ok "PR 已创建" || {
+            warn "无法自动创建 PR，请手动操作"
+            echo "  分支: $branch"
         }
     else
-        warn "未安装 gh CLI，分支已推送: $branch"
+        warn "未安装 gh CLI，请手动创建 PR"
+        echo "  仓库: $remote"
+        echo "  分支: $branch"
+        echo "  标题: [${type}] ${ns}/${name} v${version}"
     fi
+
     rm -rf "$tmpdir"
+    ok "提交完成: ${type}/${ns}/${name} v${version}"
 }
+
+########## 管理命令 ##########
 
 cmd_review() {
     need_cmd gh
     local mr="${1:-}"
-    local remote
-    remote=$(grep '^REMOTE=' "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
-    [ -z "$remote" ] && die "未配置 REMOTE"
-    local repo
+    local remote repo
+    remote=$(get_remote)
     repo=$(echo "$remote" | sed 's|.*github.com[:/]||; s|\.git$||')
 
     if [ -z "$mr" ]; then
@@ -532,7 +828,7 @@ cmd_approve() {
     local mr="${1:-}"
     [ -z "$mr" ] && die "用法: tt approve <mr-id>"
     local remote repo
-    remote=$(grep '^REMOTE=' "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
+    remote=$(get_remote)
     repo=$(echo "$remote" | sed 's|.*github.com[:/]||; s|\.git$||')
     gh pr review "$mr" --repo "$repo" --approve --body "审核通过" 2>/dev/null
     gh pr merge "$mr" --repo "$repo" --squash --delete-branch 2>/dev/null
@@ -544,7 +840,7 @@ cmd_reject() {
     local mr="${1:-}" reason="${2:-需要修改后重新提交}"
     [ -z "$mr" ] && die "用法: tt reject <mr-id> [reason]"
     local remote repo
-    remote=$(grep '^REMOTE=' "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
+    remote=$(get_remote)
     repo=$(echo "$remote" | sed 's|.*github.com[:/]||; s|\.git$||')
     gh pr close "$mr" --repo "$repo" --comment "驳回: $reason" 2>/dev/null
     ok "已驳回 #${mr}"
@@ -612,53 +908,61 @@ cmd_config() {
 main() {
     # 确保基础目录
     mkdir -p "$TT_HOME"
+    [ ! -f "$REGISTRY" ] && echo '{"tools":{}}' > "$REGISTRY"
+    [ ! -f "$CONFIG" ] && touch "$CONFIG"
 
     local cmd="${1:-}"
     case "$cmd" in
-        install|i)        shift; cmd_install "$@" ;;
-        update|up)        shift; cmd_update "$@" ;;
-        list|ls)          shift; cmd_list "$@" ;;
-        search)           shift; cmd_search "$@" ;;
-        info|show)        shift; cmd_info "$@" ;;
-        rollback|rb)      shift; cmd_rollback "$@" ;;
-        uninstall|rm)     shift; cmd_uninstall "$@" ;;
-        sync)             shift; cmd_sync "$@" ;;
-        submit)           shift; cmd_submit "$@" ;;
-        review)           shift; cmd_review "$@" ;;
-        approve)          shift; cmd_approve "$@" ;;
-        reject)           shift; cmd_reject "$@" ;;
-        stats)            cmd_stats ;;
-        config|cfg)       shift; cmd_config "$@" ;;
-        --version|-v|-V)  echo "tt version $TT_VERSION" ;;
+        install|i)         shift; cmd_install "$@" ;;
+        update|up)         shift; cmd_update "$@" ;;
+        list|ls)           shift; cmd_list "$@" ;;
+        search)            shift; cmd_search "$@" ;;
+        info|show)         shift; cmd_info "$@" ;;
+        rollback|rb)       shift; cmd_rollback "$@" ;;
+        uninstall|rm)      shift; cmd_uninstall "$@" ;;
+        new|create)        shift; cmd_new "$@" ;;
+        submit)            shift; cmd_submit "$@" ;;
+        review)            shift; cmd_review "$@" ;;
+        approve)           shift; cmd_approve "$@" ;;
+        reject)            shift; cmd_reject "$@" ;;
+        stats)             cmd_stats ;;
+        config|cfg)        shift; cmd_config "$@" ;;
+        --version|-v|-V)   echo "tt version $TT_VERSION" ;;
         --help|-h|help|"")
             cat <<HELP
 tt — Team Tools CLI  v${TT_VERSION}
 
 用法:
-  tt install <tool>           安装 tool（建立符号链接）
-  tt update [tool]            更新仓库（无参数: git pull + 刷新全部）
-  tt list [--remote]          列出已安装 / 远程可用 tool
-  tt search <keyword>         搜索 tool
-  tt info <tool>              查看 tool 详情
-  tt rollback <tool> [ver]    回滚版本
-  tt uninstall <tool>         卸载（保留仓库文件）
-  tt sync                     同步所有 tool 到 Claude Code
+  tt new <name> [--type skill|mcp|cli] [--ns global|app]
+                      创建新 tool（在标准 Claude 目录下）
+  tt install <tool>          从团队仓库安装 tool
+  tt install --all [--scope global|app] [--type skill|mcp|cli]
+                      批量安装 tool
+  tt update [tool]           检查并更新 tool 到最新版本
+  tt list [--remote]         列出已安装 / 远程可用 tool
+  tt search <keyword>        搜索 tool
+  tt info <tool>             查看 tool 详情
+  tt rollback <tool> [ver]   回滚到指定版本
+  tt uninstall <tool>        卸载 tool
+
+提交:
+  tt submit [path]           提交 tool 到团队仓库（默认当前目录）
 
 管理员:
-  tt submit <path>            提交 tool（创建分支 + PR）
-  tt review [mr-id]           审核列表 / 详情
-  tt approve <mr-id>          通过并合入
-  tt reject <mr-id> [reason]  驳回
-  tt stats                    统计信息
+  tt review [mr-id]          审核列表 / 详情
+  tt approve <mr-id>         通过并合入
+  tt reject <mr-id> [reason] 驳回
+  tt stats                   统计信息
 
 配置:
-  tt config set REMOTE=<url>            设置团队仓库地址
-  tt config set PROJECT_<app>=<path>    设置应用级项目路径
-  tt config list                        列出所有配置
+  tt config set REMOTE=<url>             设置团队仓库地址
+  tt config set PROJECT_<app>=<path>     设置应用级项目路径
+  tt config list                         列出所有配置
 
 tool 格式: [type/]namespace/name[@version]
   例: tt install global/code-review
       tt install skill/global/code-review@1.2.0
+      tt install --all --scope global --type skill
 HELP
             ;;
         *) die "未知命令: $cmd，执行 tt --help" ;;

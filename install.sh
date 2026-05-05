@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# tt — Team Tools 一键安装脚本
+# tt — Team Tools 一键安装脚本  v0.3.0
 # 用法:
-#   curl -sL <raw-url>/install.sh | bash -s -- <git-repo-url>
-#   本地: ./install.sh [git-repo-url]
+#   本地: ./install.sh <git-repo-url>
+#   远程: curl -sL <raw-url>/install.sh | bash -s -- <git-repo-url>
 
 set -euo pipefail
 
@@ -28,45 +28,49 @@ if [ -z "$REMOTE_URL" ]; then
 fi
 
 if [ -z "$REMOTE_URL" ]; then
-    warn "未指定远程仓库 URL"
+    warn "未指定团队仓库 URL"
     echo ""
     echo "  用法:"
-    echo "    curl -sL <url>/install.sh | bash -s -- <git-repo-url>"
     echo "    ./install.sh <git-repo-url>"
     echo ""
     exit 1
 fi
 
-# 2. 克隆 / 更新仓库
-if [ -d "$TT_HOME/.git" ]; then
-    info "更新本地仓库 ..."
-    git -C "$TT_HOME" pull --ff-only 2>/dev/null || warn "git pull 失败，使用现有版本"
-    ok "仓库已更新"
-else
-    info "克隆团队仓库 ..."
-    if [ -d "$TT_HOME" ]; then
-        # 目录存在但不是 git repo，备份
-        mv "$TT_HOME" "${TT_HOME}.bak.$(date +%s)"
-    fi
-    git clone "$REMOTE_URL" "$TT_HOME" 2>/dev/null || {
-        echo "  ✗ 克隆失败，请检查 URL: $REMOTE_URL"
-        exit 1
-    }
-    ok "仓库已克隆"
-fi
+# 2. 创建缓存目录（不再是 git clone）
+info "初始化 tt 缓存目录 ..."
+mkdir -p "$TT_HOME"
+ok "缓存目录: $TT_HOME"
 
-# 3. 安装 tt 命令到 PATH
+# 3. 安装 tt 命令
 info "安装 tt 命令 ..."
 mkdir -p "$BIN_DIR"
-if [ -f "$TT_HOME/bin/tt" ]; then
-    chmod +x "$TT_HOME/bin/tt"
-    ln -sf "$TT_HOME/bin/tt" "$BIN_DIR/tt"
-    ok "tt → ${BIN_DIR}/tt"
+
+# 优先从本地仓库复制（开发者场景）
+if [ -f "bin/tt" ]; then
+    chmod +x "bin/tt"
+    cp "bin/tt" "$BIN_DIR/tt"
+    ok "tt → ${BIN_DIR}/tt (本地)"
 else
-    warn "仓库中未找到 bin/tt，tt 命令不可用"
+    # 从远程下载 bin/tt
+    TMPDIR=$(mktemp -d)
+    git clone --depth 1 "$REMOTE_URL" "$TMPDIR" --quiet 2>/dev/null || {
+        rm -rf "$TMPDIR"
+        warn "克隆失败，请检查 URL: $REMOTE_URL"
+        exit 1
+    }
+    if [ -f "$TMPDIR/bin/tt" ]; then
+        chmod +x "$TMPDIR/bin/tt"
+        cp "$TMPDIR/bin/tt" "$BIN_DIR/tt"
+        ok "tt → ${BIN_DIR}/tt (远程)"
+    else
+        rm -rf "$TMPDIR"
+        warn "仓库中未找到 bin/tt"
+        exit 1
+    fi
+    rm -rf "$TMPDIR"
 fi
 
-# 4. 初始化本地配置文件
+# 4. 初始化配置文件
 if [ ! -f "${HOME}/.ttconfig" ]; then
     cat > "${HOME}/.ttconfig" <<EOF
 # tt — Team Tools 配置
@@ -84,6 +88,7 @@ else
     else
         echo "REMOTE=${REMOTE_URL}" >> "${HOME}/.ttconfig"
     fi
+    ok ".ttconfig 已更新"
 fi
 
 # 5. 初始化注册表
@@ -116,9 +121,11 @@ echo "  ╚═══════════════════════
 echo ""
 echo "  快速开始:"
 echo "    tt --help              查看帮助"
-echo "    tt list --remote       查看可用 tool"
-echo "    tt install <tool>      安装 tool"
-echo "    tt sync                同步到 Claude Code"
+echo "    tt install --all --scope global --type skill"
+echo "                            批量安装所有全局 skill"
+echo "    tt list --remote        查看可用 tool"
+echo "    tt install <tool>       安装 tool"
+echo "    tt new <name>           创建新 tool"
 echo ""
 echo "  配置应用映射 (让应用级 tool 生效):"
 echo "    tt config set PROJECT_<app>=/path/to/project"
