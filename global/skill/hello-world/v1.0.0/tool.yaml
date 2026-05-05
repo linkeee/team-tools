@@ -1,0 +1,9 @@
+name: hello-world
+type: skill
+namespace: global
+version: 1.0.0
+description: 示例 skill，展示标准的 tool 目录结构
+author: team
+entrypoint: SKILL.md
+dependencies: []
+min_claude_version: "1.0.0"

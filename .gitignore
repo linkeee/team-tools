@@ -1,0 +1,21 @@
+# .gitignore
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# temporary files
+*.tmp
+*.bak
+
+# 团队成员本地状态（不提交）
+.registry.json
+.cache/
+
+# current 符号链接是个人选择，不提交
+**/current
