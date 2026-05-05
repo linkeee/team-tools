@@ -28,11 +28,11 @@
 ## 安装
 
 ```bash
-# 一键安装（需要团队仓库地址）
-./install.sh <git-repo-url>
+# 一行命令安装
+curl -sL https://raw.githubusercontent.com/linkeee/team-tools/main/install.sh | bash
 
-# 或远程安装
-curl -sL <raw-install-url> | bash -s -- <git-repo-url>
+# 自定义仓库地址
+curl -sL https://raw.githubusercontent.com/linkeee/team-tools/main/install.sh | bash -s -- <your-git-repo-url>
 ```
 
 依赖：`git`、`python3`、`PyYAML`（`pip3 install pyyaml`）、`gh`（创建 PR 需要）

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # tt — Team Tools 一键安装脚本  v0.3.0
 # 用法:
-#   本地: ./install.sh <git-repo-url>
-#   远程: curl -sL <raw-url>/install.sh | bash -s -- <git-repo-url>
+#   curl -sL <url>/install.sh | bash
+#   ./install.sh [git-repo-url]   # 自定义仓库地址（可选）
 
 set -euo pipefail
 
 TT_HOME="${HOME}/.claude/team-tools"
 BIN_DIR="${HOME}/bin"
-REMOTE_URL="${1:-}"
+DEFAULT_REMOTE="git@github.com:linkeee/team-tools.git"
+REMOTE_URL="${1:-$DEFAULT_REMOTE}"
 
 info() { echo "  → $*"; }
 ok()   { echo "  ✓ $*"; }
@@ -20,28 +21,12 @@ echo "  ║       tt — Team Tools Installer     ║"
 echo "  ╚══════════════════════════════════════╝"
 echo ""
 
-# 1. 确定远程仓库 URL
-if [ -z "$REMOTE_URL" ]; then
-    if [ -f "${HOME}/.ttconfig" ]; then
-        REMOTE_URL=$(grep '^REMOTE=' "${HOME}/.ttconfig" 2>/dev/null | cut -d= -f2- || true)
-    fi
-fi
-
-if [ -z "$REMOTE_URL" ]; then
-    warn "未指定团队仓库 URL"
-    echo ""
-    echo "  用法:"
-    echo "    ./install.sh <git-repo-url>"
-    echo ""
-    exit 1
-fi
-
-# 2. 创建缓存目录（不再是 git clone）
+# 1. 创建缓存目录（不再是 git clone）
 info "初始化 tt 缓存目录 ..."
 mkdir -p "$TT_HOME"
 ok "缓存目录: $TT_HOME"
 
-# 3. 安装 tt 命令
+# 2. 安装 tt 命令
 info "安装 tt 命令 ..."
 mkdir -p "$BIN_DIR"
 
@@ -70,7 +55,7 @@ else
     rm -rf "$TMPDIR"
 fi
 
-# 4. 初始化配置文件
+# 3. 初始化配置文件
 if [ ! -f "${HOME}/.ttconfig" ]; then
     cat > "${HOME}/.ttconfig" <<EOF
 # tt — Team Tools 配置
@@ -91,13 +76,13 @@ else
     ok ".ttconfig 已更新"
 fi
 
-# 5. 初始化注册表
+# 4. 初始化注册表
 if [ ! -f "$TT_HOME/.registry.json" ]; then
     echo '{"tools":{}}' > "$TT_HOME/.registry.json"
     ok "注册表已初始化"
 fi
 
-# 6. 检查 PATH
+# 5. 检查 PATH
 if ! echo "$PATH" | grep -q "$BIN_DIR"; then
     warn "请将 ~/bin 添加到 PATH:"
     echo ""
@@ -106,7 +91,7 @@ if ! echo "$PATH" | grep -q "$BIN_DIR"; then
     echo ""
 fi
 
-# 7. 检查依赖
+# 6. 检查依赖
 if ! command -v python3 >/dev/null 2>&1; then
     warn "需要 python3"
 fi
