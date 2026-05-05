@@ -1,0 +1,8 @@
+name: test-demo
+type: skill
+namespace: demo
+version: 1.0.0
+description:
+author: link
+entrypoint: SKILL.md
+dependencies: []
