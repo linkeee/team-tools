@@ -330,15 +330,21 @@ with open('$settings', 'w') as f: json.dump(cfg, f, indent=2)
             fi
             ;;
         cli)
-            mkdir -p "$HOME/.claude/bin"
+            local cli_bin="$HOME/.claude/bin"
+            if [ "$ns" != "global" ]; then
+                local proj
+                proj=$(grep "^PROJECT_${ns}=" "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
+                cli_bin="$proj/.claude/bin"
+            fi
+            mkdir -p "$cli_bin"
             local entry
             entry=$(yaml_get "$target/tool.yaml" entrypoint)
             [ -z "$entry" ] && entry="$name"
             if [ -f "$target/$entry" ]; then
                 chmod +x "$target/$entry"
-                rm -f "$HOME/.claude/bin/$name"
-                ln -sf "$target/$entry" "$HOME/.claude/bin/$name"
-                ok "CLI 已链接到 ~/bin/$name"
+                rm -f "$cli_bin/$name"
+                ln -sf "$target/$entry" "$cli_bin/$name"
+                ok "CLI 已链接到 ${cli_bin/$HOME/~}/$name"
             fi
             ;;
     esac
@@ -589,7 +595,16 @@ cmd_uninstall() {
     ok "已移除 $dir"
 
     # 清理 CLI 链接
-    [ "$type" = "cli" ] && rm -f "$HOME/.claude/bin/$name" && ok "已移除 ~/.claude/bin/$name"
+    if [ "$type" = "cli" ]; then
+        local cli_bin="$HOME/.claude/bin"
+        if [ "$ns" != "global" ]; then
+            local proj
+            proj=$(grep "^PROJECT_${ns}=" "$CONFIG" 2>/dev/null | cut -d= -f2- || true)
+            cli_bin="$proj/.claude/bin"
+        fi
+        rm -f "$cli_bin/$name"
+        ok "已移除 ${cli_bin/$HOME/~}/$name"
+    fi
 
     # 清理 MCP 配置
     if [ "$type" = "mcp" ]; then
