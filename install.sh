@@ -7,7 +7,7 @@
 set -euo pipefail
 
 TT_HOME="${HOME}/.claude/team-tools"
-BIN_DIR="/usr/local/bin"
+BIN_DIR="${HOME}/.claude/bin"
 DEFAULT_REMOTE="git@github.com:linkeee/team-tools.git"
 REMOTE_URL="${1:-$DEFAULT_REMOTE}"
 
@@ -28,18 +28,12 @@ ok "缓存目录: $TT_HOME"
 
 # 2. 安装 tt 命令
 info "安装 tt 命令到 $BIN_DIR ..."
-if [ ! -w "$BIN_DIR" ]; then
-    info "需要 sudo 权限写入 $BIN_DIR"
-    MAYBE_SUDO="sudo"
-else
-    MAYBE_SUDO=""
-fi
-mkdir -p "$BIN_DIR" 2>/dev/null || sudo mkdir -p "$BIN_DIR"
+mkdir -p "$BIN_DIR"
 
 # 优先从本地仓库复制（开发者场景）
 if [ -f "bin/tt" ]; then
     chmod +x "bin/tt"
-    $MAYBE_SUDO cp "bin/tt" "$BIN_DIR/tt"
+    cp "bin/tt" "$BIN_DIR/tt"
     ok "tt → ${BIN_DIR}/tt (本地)"
 else
     # 从远程下载 bin/tt
@@ -51,7 +45,7 @@ else
     }
     if [ -f "$TMPDIR/bin/tt" ]; then
         chmod +x "$TMPDIR/bin/tt"
-        $MAYBE_SUDO cp "$TMPDIR/bin/tt" "$BIN_DIR/tt"
+        cp "$TMPDIR/bin/tt" "$BIN_DIR/tt"
         ok "tt → ${BIN_DIR}/tt (远程)"
     else
         rm -rf "$TMPDIR"
@@ -90,9 +84,9 @@ fi
 
 # 5. 检查 PATH
 if ! echo "$PATH" | grep -q "$BIN_DIR"; then
-    warn "请将 $BIN_DIR 添加到 PATH:"
+    warn "请将 ~/.claude/bin 添加到 PATH:"
     echo ""
-    echo "    echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc"
+    echo "    echo 'export PATH=\"\$HOME/.claude/bin:\$PATH\"' >> ~/.zshrc"
     echo "    source ~/.zshrc"
     echo ""
 fi
