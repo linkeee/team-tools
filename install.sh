@@ -8,7 +8,7 @@ set -euo pipefail
 
 TT_HOME="${HOME}/.claude/team-tools"
 BIN_DIR="${HOME}/.claude/bin"
-DEFAULT_REMOTE="git@github.com:linkeee/team-tools.git"
+DEFAULT_REMOTE="git@gitlab.shizhuang-inc.com:linkeee/team-tools.git"
 REMOTE_URL="${1:-$DEFAULT_REMOTE}"
 
 info() { echo "  → $*"; }
@@ -61,6 +61,9 @@ if [ ! -f "${HOME}/.ttconfig" ]; then
 # tt — Team Tools 配置
 REMOTE=${REMOTE_URL}
 
+	# GitLab Access Token（创建 MR 需要，在 GitLab → Settings → Access Tokens 创建，勾选 api 权限）
+	# GITLAB_TOKEN=glpat-xxxx
+
 # namespace → 项目路径映射（应用级 tool 需要）
 # PROJECT_<namespace>=/absolute/path/to/project
 # 例: PROJECT_trade-inventory-platform=/Users/zhangsan/work/trade-platform
@@ -98,6 +101,9 @@ fi
 if ! python3 -c "import yaml" 2>/dev/null; then
     warn "需要 PyYAML，执行: pip3 install pyyaml"
 fi
+if ! command -v curl >/dev/null 2>&1; then
+    warn "需要 curl"
+fi
 
 echo ""
 echo "  ╔══════════════════════════════════════╗"
@@ -106,6 +112,8 @@ echo "  ╚═══════════════════════
 echo ""
 echo "  快速开始:"
 echo "    tt --help              查看帮助"
+echo "    tt config set GITLAB_TOKEN=<token>"
+echo "                            配置 GitLab Access Token（创建 MR 需要）"
 echo "    tt install --all --scope global --type skill"
 echo "                            批量安装所有全局 skill"
 echo "    tt list --remote        查看可用 tool"

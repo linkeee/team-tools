@@ -123,6 +123,75 @@ except: pass
     echo "$val"
 }
 
+########## GitLab API 辅助 ##########
+
+# 从 REMOTE 解析 host
+parse_remote_host() {
+    local remote
+    remote=$(get_remote)
+    echo "$remote" | sed -E 's|^.*@([^:]+):.*|\1|; s|^https?://([^/]+)/.*|\1|'
+}
+
+# 从 REMOTE 解析项目路径 (group/repo)
+parse_remote_path() {
+    local remote
+    remote=$(get_remote)
+    echo "$remote" | sed -E 's|^.*@[^:]+:(.*)\.git$|\1|; s|^https?://[^/]+/(.*)\.git$|\1|'
+}
+
+# 检查 token 和 curl
+need_token() {
+    local token
+    token=$(grep '^GITLAB_TOKEN=' "$CONFIG" 2>/dev/null | cut -d= -f2-)
+    [ -z "$token" ] && die "请先配置 GitLab Token: tt config set GITLAB_TOKEN=<your-token>（需 api 权限，在 GitLab → Settings → Access Tokens 创建）"
+    command -v curl >/dev/null 2>&1 || die "需要 curl"
+}
+
+# 统一 GitLab API 调用
+gitlab_api() {
+    local method="$1" endpoint="$2" data="${3:-}"
+    local host path encoded token http_code body
+    host=$(parse_remote_host)
+    path=$(parse_remote_path)
+    encoded=$(python3 -c "from urllib.parse import quote; print(quote('$path', safe=''))" 2>/dev/null || echo "$path")
+    token=$(grep '^GITLAB_TOKEN=' "$CONFIG" 2>/dev/null | cut -d= -f2-)
+    [ -z "$token" ] && die "未配置 GITLAB_TOKEN"
+
+    local url="https://${host}/api/v4/projects/${encoded}${endpoint}"
+
+    case "$method" in
+        GET)
+            curl -s -w "\n%{http_code}" -H "PRIVATE-TOKEN: $token" "$url"
+            ;;
+        POST)
+            curl -s -w "\n%{http_code}" -H "PRIVATE-TOKEN: $token" -H "Content-Type: application/json" -X POST -d "$data" "$url"
+            ;;
+        PUT)
+            curl -s -w "\n%{http_code}" -H "PRIVATE-TOKEN: $token" -H "Content-Type: application/json" -X PUT -d "$data" "$url"
+            ;;
+    esac
+}
+
+# 从 gitlab_api 响应中分离 body 和 http_code
+api_body() { echo "$1" | sed '$d'; }
+api_code() { echo "$1" | tail -1; }
+
+# 获取 API 响应中的错误信息
+api_error() {
+    local body
+    body=$(api_body "$1")
+    echo "$body" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    if isinstance(d,dict):
+        print(d.get('message','') or d.get('error','') or '')
+    elif isinstance(d,list):
+        print(d[0].get('message','') if d else '')
+except: pass
+" 2>/dev/null
+}
+
 ########## 远程操作 ##########
 
 # 浅克隆远程仓库到临时目录
@@ -702,7 +771,7 @@ SH
 
 ########## 提交 tool ##########
 
-# tt submit [path]  — 提交 tool（自动检测 + 生成元信息 + 创建 PR）
+# tt submit [path]  — 提交 tool（自动检测 + 生成元信息 + 创建 MR）
 cmd_submit() {
     need_cmd git
     local path="${1:-.}"
@@ -797,24 +866,39 @@ with open('$abs_path/tool.yaml', 'w') as f: yaml.dump(data, f, allow_unicode=Tru
     }
     git -C "$tmpdir" push origin "$branch" --quiet 2>/dev/null || die "推送失败，请检查 git 写权限"
 
-    # 9. 创建 PR
-    if command -v gh >/dev/null 2>&1; then
-        local repo
-        repo=$(echo "$remote" | sed 's|.*github.com[:/]||; s|\.git$||')
-        gh pr create --repo "$repo" --head "$branch" --base main \
-            --title "[${type}] ${ns}/${name} v${version}" \
-            --body "提交者: $(whoami)
-
-类型: ${type}  命名空间: ${ns}  版本: v${version}
-描述: ${description:-无}" 2>/dev/null && ok "PR 已创建" || {
-            warn "无法自动创建 PR，请手动操作"
+    # 9. 创建 MR（通过 GitLab API）
+    if grep -q '^GITLAB_TOKEN=' "$CONFIG" 2>/dev/null; then
+        local mr_body mr_resp
+        mr_body=$(python3 -c "
+import json
+print(json.dumps({
+    'source_branch': '$branch',
+    'target_branch': 'main',
+    'title': '[$type] $ns/$name v$version',
+    'description': '提交者: $(whoami)\n\n类型: $type  命名空间: $ns  版本: v$version\n描述: ${description:-无}',
+    'remove_source_branch': True,
+    'squash': False
+}))
+")
+        mr_resp=$(gitlab_api POST "/merge_requests" "$mr_body")
+        if [ "$(api_code "$mr_resp")" = "201" ]; then
+            local mr_url
+            mr_url=$(api_body "$mr_resp" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('web_url','?'))" 2>/dev/null || echo "?")
+            ok "MR 已创建: $mr_url"
+        else
+            warn "无法自动创建 MR（API 返回 $(api_code "$mr_resp")）"
+            local errmsg
+            errmsg=$(api_error "$mr_resp")
+            [ -n "$errmsg" ] && echo "  $errmsg"
             echo "  分支: $branch"
-        }
+        fi
     else
-        warn "未安装 gh CLI，请手动创建 PR"
+        warn "未配置 GITLAB_TOKEN，请手动创建 MR"
         echo "  仓库: $remote"
         echo "  分支: $branch"
         echo "  标题: [${type}] ${ns}/${name} v${version}"
+        echo ""
+        info "配置 Token 即可自动创建: tt config set GITLAB_TOKEN=<your-token>"
     fi
 
     rm -rf "$tmpdir"
@@ -824,41 +908,93 @@ with open('$abs_path/tool.yaml', 'w') as f: yaml.dump(data, f, allow_unicode=Tru
 ########## 管理命令 ##########
 
 cmd_review() {
-    need_cmd gh
+    need_token
     local mr="${1:-}"
-    local remote repo
-    remote=$(get_remote)
-    repo=$(echo "$remote" | sed 's|.*github.com[:/]||; s|\.git$||')
 
     if [ -z "$mr" ]; then
-        info "待审核 PR:"
-        gh pr list --repo "$repo" --state open 2>/dev/null
+        info "待审核 MR:"
+        local resp
+        resp=$(gitlab_api GET "/merge_requests?state=opened&per_page=20")
+        if [ "$(api_code "$resp")" != "200" ]; then
+            local errmsg
+            errmsg=$(api_error "$resp")
+            die "获取 MR 列表失败: ${errmsg:-HTTP $(api_code "$resp")}"
+        fi
+        api_body "$resp" | python3 -c "
+import json,sys
+mrs=json.load(sys.stdin)
+if not mrs:
+    print('  (空)')
+else:
+    for m in mrs:
+        print(f\"  !{m['iid']:>5}  {m['title']:<50}  {m['source_branch']:<40}  {m.get('author',{}).get('username','?')}\")
+" 2>/dev/null || api_body "$resp"
     else
-        gh pr view "$mr" --repo "$repo" 2>/dev/null
+        local resp
+        resp=$(gitlab_api GET "/merge_requests/${mr}")
+        if [ "$(api_code "$resp")" != "200" ]; then
+            die "MR !${mr} 不存在或无法访问"
+        fi
+        api_body "$resp" | python3 -c "
+import json,sys
+m=json.load(sys.stdin)
+print(f\"  !{m['iid']} — {m['title']}\")
+print(f\"  状态:     {m['state']}\")
+print(f\"  源分支:   {m['source_branch']}\")
+print(f\"  目标分支: {m['target_branch']}\")
+print(f\"  作者:     {m.get('author',{}).get('name','?')} (@{m.get('author',{}).get('username','?')})\")
+print(f\"  链接:     {m.get('web_url','')}\")
+if m.get('description'):
+    print(f\"\\n  描述:\\n  {m['description']}\")
+" 2>/dev/null || api_body "$resp"
     fi
 }
 
 cmd_approve() {
-    need_cmd gh
+    need_token
     local mr="${1:-}"
     [ -z "$mr" ] && die "用法: tt approve <mr-id>"
-    local remote repo
-    remote=$(get_remote)
-    repo=$(echo "$remote" | sed 's|.*github.com[:/]||; s|\.git$||')
-    gh pr review "$mr" --repo "$repo" --approve --body "审核通过" 2>/dev/null
-    gh pr merge "$mr" --repo "$repo" --squash --delete-branch 2>/dev/null
-    ok "已通过并合入 #${mr}"
+    local resp
+
+    # 1. Approve
+    resp=$(gitlab_api POST "/merge_requests/${mr}/approve")
+    if [ "$(api_code "$resp")" = "201" ] || [ "$(api_code "$resp")" = "200" ]; then
+        ok "已通过 !${mr}"
+    else
+        local errmsg
+        errmsg=$(api_error "$resp")
+        warn "通过操作: ${errmsg:-HTTP $(api_code "$resp")}（可能已通过或无需审批）"
+    fi
+
+    # 2. Merge
+    resp=$(gitlab_api PUT "/merge_requests/${mr}/merge" '{"squash":true,"should_remove_source_branch":true}')
+    if [ "$(api_code "$resp")" = "200" ]; then
+        ok "已合入 !${mr}"
+    else
+        local errmsg
+        errmsg=$(api_error "$resp")
+        die "合入失败: ${errmsg:-HTTP $(api_code "$resp")}"
+    fi
 }
 
 cmd_reject() {
-    need_cmd gh
+    need_token
     local mr="${1:-}" reason="${2:-需要修改后重新提交}"
     [ -z "$mr" ] && die "用法: tt reject <mr-id> [reason]"
-    local remote repo
-    remote=$(get_remote)
-    repo=$(echo "$remote" | sed 's|.*github.com[:/]||; s|\.git$||')
-    gh pr close "$mr" --repo "$repo" --comment "驳回: $reason" 2>/dev/null
-    ok "已驳回 #${mr}"
+    local resp
+
+    # 先添加驳回评论
+    gitlab_api POST "/merge_requests/${mr}/notes" "$(python3 -c "import json; print(json.dumps({'body':'驳回: $reason'}))")" >/dev/null 2>&1
+
+    # 关闭 MR
+    resp=$(gitlab_api PUT "/merge_requests/${mr}" '{"state_event":"close"}')
+    if [ "$(api_code "$resp")" = "200" ]; then
+        ok "已驳回 !${mr}: $reason"
+    else
+        local errmsg
+        errmsg=$(api_error "$resp")
+        die "操作失败: ${errmsg:-HTTP $(api_code "$resp")}"
+    fi
 }
 
 cmd_stats() {
@@ -970,9 +1106,10 @@ tt — Team Tools CLI  v${TT_VERSION}
   tt stats                   统计信息
 
 配置:
-  tt config set REMOTE=<url>             设置团队仓库地址
-  tt config set PROJECT_<app>=<path>     设置应用级项目路径
-  tt config list                         列出所有配置
+  tt config set REMOTE=<url>                 设置团队仓库地址
+  tt config set GITLAB_TOKEN=<token>         设置 GitLab Access Token（需 api 权限）
+  tt config set PROJECT_<app>=<path>         设置应用级项目路径
+  tt config list                             列出所有配置
 
 tool 格式: [type/]namespace/name[@version]
   例: tt install global/code-review
